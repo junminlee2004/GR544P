@@ -1,7 +1,7 @@
 # GR544P
 A TAIHEN plugin for enabling a feature complete 544p resolution upgrade for Gravity Rush on the PS VITA
 
-This plugin is region agnostic and will work for any Gravity Rush region
+This plugin is region agnostic and will work for any Gravity Rush game region
 
 This plugin functions like any TAIHEN plugin in terms of installation
 
