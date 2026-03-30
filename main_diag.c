@@ -1,8 +1,8 @@
 /*
- * GR544P v37b — Scale frame corners + Z depth
+ * GR544P v38c — Expand frame + offset position
  *
- * Frame corners scaled by 4/3 around center.
- * Z axis scaled by 2.0 for 3D comic depth.
+ * EXPAND adds size to the BR corner only (TL stays put).
+ * OFFSET shifts the ENTIRE frame (both TL and BR equally).
  */
 
 #include <psp2/kernel/modulemgr.h>
@@ -10,12 +10,10 @@
 #include <taihen.h>
 
 /* ============================================================ */
-#define SCALE     1.33333f
-#define CENTER_X  0.0f
-#define CENTER_Y -0.385f
-#define OFFSET_X  0.0f       /* + = shift frame right */
-#define OFFSET_Y  -1.0f       /* - = shift frame down */
-#define SCALE_Z   2.0f
+#define EXPAND_RIGHT   9.80f    /* extra width to the right */
+#define EXPAND_DOWN    1.1f    /* extra height to the bottom */
+#define OFFSET_X       0.0f     /* + = shift whole frame right */
+#define OFFSET_Y       -0.37f     /* - = shift whole frame down */
 /* ============================================================ */
 
 #define MAX_INJECT 16
@@ -24,13 +22,6 @@ static int g_ninject = 0;
 
 static SceUID         g_hook_id = -1;
 static tai_hook_ref_t g_hook_ref;
-
-static int is_frame_corner(uint32_t lr) {
-    return (lr == 0x813B3F61 ||
-            lr == 0x813B3F85 ||
-            lr == 0x813B5181 ||
-            lr == 0x813B51AD);
-}
 
 static void inject(SceUID modid, int seg, uint32_t off,
                    const void *data, size_t len)
@@ -44,17 +35,31 @@ static int hookTransform(uint32_t r0) {
     uint32_t lr;
     __asm__ volatile("mov %0, lr" : "=r"(lr));
 
-    if (is_frame_corner(lr) && r0) {
+    /* Top-left corners: offset only */
+    if ((lr == 0x813B3F61 || lr == 0x813B5181) && r0) {
         volatile float *f = (volatile float *)r0;
-        float s0 = f[0], s1 = f[1], s2 = f[2];
+        float s0 = f[0], s1 = f[1];
 
-        f[0] = s0 * SCALE + CENTER_X * (1.0f - SCALE) + OFFSET_X;
-        f[1] = s1 * SCALE + CENTER_Y * (1.0f - SCALE) + OFFSET_Y;
-        f[2] = s2 * SCALE_Z;
+        f[0] = s0 + OFFSET_X;
+        f[1] = s1 + OFFSET_Y;
 
         int ret = TAI_CONTINUE(int, g_hook_ref, r0);
 
-        f[0] = s0; f[1] = s1; f[2] = s2;
+        f[0] = s0; f[1] = s1;
+        return ret;
+    }
+
+    /* Bottom-right corners: expand + offset */
+    if ((lr == 0x813B3F85 || lr == 0x813B51AD) && r0) {
+        volatile float *f = (volatile float *)r0;
+        float s0 = f[0], s1 = f[1];
+
+        f[0] = s0 + EXPAND_RIGHT + OFFSET_X;
+        f[1] = s1 - EXPAND_DOWN + OFFSET_Y;
+
+        int ret = TAI_CONTINUE(int, g_hook_ref, r0);
+
+        f[0] = s0; f[1] = s1;
         return ret;
     }
 
