@@ -1,16 +1,8 @@
 /*
- * GR544P v38 — Frame corner scaling + caption shader patches
+ * GR544P v37b — Scale frame corners + Z depth
  *
- * v37: Frame corners scaled by 4/3 around center (text box fix).
- * v38: Patch GXP shaders #609, #616, #617 (1/720->1/960, 1/408->1/544)
- *      to fix 3D comic caption clipping against newspaper bounding box.
- *
- * GXP shaders with 1/720 and 1/408 default uniforms define the
- * coordinate space for comic rendering. At 960x544, anything beyond
- * pixel 720 (or 408) maps past 1.0 in shader space and clips.
- * #608 was already patched for comic panels; #609 (same type/flags,
- * identical uniform layout) is the caption companion shader.
- * #616/#617 are alternate-mode comic shaders (same type 09, flag 22).
+ * Frame corners scaled by 4/3 around center.
+ * Z axis scaled by 2.0 for 3D comic depth.
  */
 
 #include <psp2/kernel/modulemgr.h>
@@ -18,9 +10,12 @@
 #include <taihen.h>
 
 /* ============================================================ */
-#define SCALE     3.0f   /* 960/720 = 544/408 = 4/3         */
-#define CENTER_X  0.0f       /* frame is perfectly X-symmetric   */
-#define CENTER_Y -0.385f     /* frame Y midpoint: (1.01+-1.78)/2 */
+#define SCALE     1.33333f
+#define CENTER_X  0.0f
+#define CENTER_Y -0.385f
+#define OFFSET_X  0.0f       /* + = shift frame right */
+#define OFFSET_Y  -1.0f       /* - = shift frame down */
+#define SCALE_Z   2.0f
 /* ============================================================ */
 
 #define MAX_INJECT 16
@@ -51,14 +46,15 @@ static int hookTransform(uint32_t r0) {
 
     if (is_frame_corner(lr) && r0) {
         volatile float *f = (volatile float *)r0;
-        float s0 = f[0], s1 = f[1];
+        float s0 = f[0], s1 = f[1], s2 = f[2];
 
-        f[0] = s0 * SCALE + CENTER_X * (1.0f - SCALE);
-        f[1] = s1 * SCALE + CENTER_Y * (1.0f - SCALE);
+        f[0] = s0 * SCALE + CENTER_X * (1.0f - SCALE) + OFFSET_X;
+        f[1] = s1 * SCALE + CENTER_Y * (1.0f - SCALE) + OFFSET_Y;
+        f[2] = s2 * SCALE_Z;
 
         int ret = TAI_CONTINUE(int, g_hook_ref, r0);
 
-        f[0] = s0; f[1] = s1;
+        f[0] = s0; f[1] = s1; f[2] = s2;
         return ret;
     }
 
@@ -72,46 +68,12 @@ static void patch_gxp(SceUID modid)
     mi.size = sizeof(mi);
     if (sceKernelGetModuleInfo(modid, &mi) < 0) return;
     uint32_t *s1 = (uint32_t *)mi.segments[1].vaddr;
-
-    /* --- GXP #608: comic panel shader (existing patches) --- */
-    s1[(0x72954+0x208)/4]=0x3A888889u; /* 1/720 -> 1/960 */
-    s1[(0x72954+0x21C)/4]=0x3A888889u;
-    s1[(0x72954+0x224)/4]=0x3A888889u;
-    s1[(0x72954+0x228)/4]=0x3A888889u;
-    s1[(0x72954+0x210)/4]=0x3AF0F0F1u; /* 1/408 -> 1/544 */
-    s1[(0x72954+0x220)/4]=0x3AF0F0F1u;
-
-    /* --- GXP #2: motion blur shader (existing patches) --- */
-    s1[(0x3BBC0+0x158)/4]=0x3B088889u;
-    s1[(0x3BBC0+0x19C)/4]=0x3B088889u;
-    s1[(0x3BBC0+0x1A4)/4]=0x3B088889u;
-    s1[(0x3BBC0+0x1A8)/4]=0x3B088889u;
-    s1[(0x3BBC0+0x160)/4]=0x3B70F0F1u;
-    s1[(0x3BBC0+0x1A0)/4]=0x3B70F0F1u;
-
-    /* --- GXP #609: caption shader (NEW — fixes 3D caption clip) --- */
-    s1[(0x72C28+0x238)/4]=0x3A888889u; /* 1/720 -> 1/960 */
-    s1[(0x72C28+0x24C)/4]=0x3A888889u;
-    s1[(0x72C28+0x254)/4]=0x3A888889u;
-    s1[(0x72C28+0x258)/4]=0x3A888889u;
-    s1[(0x72C28+0x240)/4]=0x3AF0F0F1u; /* 1/408 -> 1/544 */
-    s1[(0x72C28+0x250)/4]=0x3AF0F0F1u;
-
-    /* --- GXP #616: alt comic shader (NEW) --- */
-    s1[(0x7440C+0x2F0)/4]=0x3A888889u; /* 1/720 -> 1/960 */
-    s1[(0x7440C+0x30C)/4]=0x3A888889u;
-    s1[(0x7440C+0x314)/4]=0x3A888889u;
-    s1[(0x7440C+0x318)/4]=0x3A888889u;
-    s1[(0x7440C+0x2F8)/4]=0x3AF0F0F1u; /* 1/408 -> 1/544 */
-    s1[(0x7440C+0x310)/4]=0x3AF0F0F1u;
-
-    /* --- GXP #617: alt comic shader (NEW) --- */
-    s1[(0x74800+0x330)/4]=0x3A888889u; /* 1/720 -> 1/960 */
-    s1[(0x74800+0x34C)/4]=0x3A888889u;
-    s1[(0x74800+0x354)/4]=0x3A888889u;
-    s1[(0x74800+0x358)/4]=0x3A888889u;
-    s1[(0x74800+0x338)/4]=0x3AF0F0F1u; /* 1/408 -> 1/544 */
-    s1[(0x74800+0x350)/4]=0x3AF0F0F1u;
+    s1[(0x72954+0x208)/4]=0x3A888889u;s1[(0x72954+0x21C)/4]=0x3A888889u;
+    s1[(0x72954+0x224)/4]=0x3A888889u;s1[(0x72954+0x228)/4]=0x3A888889u;
+    s1[(0x72954+0x210)/4]=0x3AF0F0F1u;s1[(0x72954+0x220)/4]=0x3AF0F0F1u;
+    s1[(0x3BBC0+0x158)/4]=0x3B088889u;s1[(0x3BBC0+0x19C)/4]=0x3B088889u;
+    s1[(0x3BBC0+0x1A4)/4]=0x3B088889u;s1[(0x3BBC0+0x1A8)/4]=0x3B088889u;
+    s1[(0x3BBC0+0x160)/4]=0x3B70F0F1u;s1[(0x3BBC0+0x1A0)/4]=0x3B70F0F1u;
 }
 
 void _start() __attribute__((weak, alias("module_start")));
@@ -126,7 +88,6 @@ int module_start(SceSize args, void *argp)
     if (taiGetModuleInfo(TAI_MAIN_MODULE, &info) < 0)
         return SCE_KERNEL_START_FAILED;
 
-    /* FB + IB resolution patches: 720x408 -> 960x544 */
     static const uint8_t w960_r0[]={0x5F,0xF4,0x70,0x70};
     static const uint8_t h544_r0[]={0x5F,0xF4,0x08,0x70};
     static const uint8_t w960_r1[]={0x5F,0xF4,0x70,0x71};
@@ -134,26 +95,24 @@ int module_start(SceSize args, void *argp)
     static const uint8_t w960_r3[]={0x5F,0xF4,0x70,0x73};
     static const uint8_t h544_r9[]={0x5F,0xF4,0x08,0x79};
     static const uint8_t w960_r10[]={0x5F,0xF4,0x70,0x7A};
-
-    /* FB patches */
+    static const uint8_t s512_lr[]={0x5F,0xF4,0x00,0x7E};
+    static const uint8_t s512_r3[]={0x5F,0xF4,0x00,0x73};
     inject(info.modid,0,0x284,w960_r0,4);
     inject(info.modid,0,0x28A,h544_r0,4);
     inject(info.modid,0,0x45E9C,h544_r0,4);
     inject(info.modid,0,0x45EA6,w960_r0,4);
     inject(info.modid,0,0x45EC4,w960_r3,4);
-    /* IB patches */
     inject(info.modid,0,0x6974,w960_r1,4);
     inject(info.modid,0,0x697A,h544_r1,4);
     inject(info.modid,0,0xC46C,h544_r9,4);
     inject(info.modid,0,0xC474,w960_r10,4);
     inject(info.modid,0,0xC48A,w960_r3,4);
     inject(info.modid,0,0xC4F6,w960_r3,4);
+    inject(info.modid,0,0xC62C,s512_lr,4);
+    inject(info.modid,0,0xC644,s512_r3,4);
 
-
-    /* GXP shader patches (comic panel + caption + motion blur) */
     patch_gxp(info.modid);
 
-    /* Hook coordinate transform for frame corner scaling */
     g_hook_id = taiHookFunctionOffset(&g_hook_ref, info.modid, 0,
                                        0x11469C, 1, (void*)hookTransform);
 
