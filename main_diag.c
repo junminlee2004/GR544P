@@ -18,7 +18,7 @@
 #include <taihen.h>
 
 /* ============================================================ */
-#define SCALE     1.33333f   /* 960/720 = 544/408 = 4/3         */
+#define SCALE     3.0f   /* 960/720 = 544/408 = 4/3         */
 #define CENTER_X  0.0f       /* frame is perfectly X-symmetric   */
 #define CENTER_Y -0.385f     /* frame Y midpoint: (1.01+-1.78)/2 */
 /* ============================================================ */
