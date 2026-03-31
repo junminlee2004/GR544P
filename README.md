@@ -27,5 +27,4 @@ ur0:tai/GR544P.suprx
 
 ur0:tai/GR544P.suprx
 
-https://ko-fi.com/junminlee2004
-Buy me a Kofi here  ^
+Buy me a Kofi here -> https://ko-fi.com/junminlee2004
