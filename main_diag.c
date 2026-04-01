@@ -44,10 +44,10 @@
  * ============================================================ */
 #define GXP_A   1   /* #608 + #609 — comic panel + caption       */
 #define GXP_B   1   /* #2   — motion blur                        */
-#define GXP_C   1   /* #604 + #605                                */
-#define GXP_D1  0   /* #613 only                                  */
+#define GXP_C   0   /* #604 + #605                                */
+#define GXP_D1  1   /* #613 only                                  */
 #define GXP_D2  0   /* #614 only                                  */
-#define GXP_E1  0   /* #616 only                                  */
+#define GXP_E1  1   /* #616 only                                  */
 #define GXP_E2  0   /* #617 only                                  */
 #define GXP_F   0   /* #24                                        */
 #define GXP_G   0   /* #238                                       */
