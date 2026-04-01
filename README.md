@@ -27,4 +27,6 @@ ur0:tai/GR544P.suprx
 
 ur0:tai/GR544P.suprx
 
+THEN RESTART YOUR VITA
+
 Buy me a Kofi here -> https://ko-fi.com/junminlee2004
