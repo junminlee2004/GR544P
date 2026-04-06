@@ -1,306 +1,498 @@
 /*
- * GR544P v41 — Clean build
+ * GR544P v59 — Multi-type draw throttle
  *
- * Resolution: 960×544 (native Vita display, up from 720×408)
- * GPU perf: shadow map 16×16
- * Text: textbox expansion via hookTransform, scroll/cull fixes,
- *       credits canvas fix via TextViewer hook
- * Shaders: nuclear GXP reciprocal sweep (78 patches across 619 shaders)
+ * v59: Extends particle throttle to distortion and effect shaders.
+ *   Reads SceGxmFragmentProgram* from ctx+0x44 (confirmed v58d).
+ *   Checks GXP type at SceGxmProgram+0x14, throttles by type:
+ *
+ *   PARTICLE_DIVISOR:    000030C1 / 000032C1  (29 shaders, fire/smoke)
+ *   DISTORTION_DIVISOR:  00003041  (2 shaders, MBH/typhoon vortex warp)
+ *   EFFECT_DIVISOR:      00001801  (12 shaders, attack debris passes)
+ *
+ *   MBH: 00003041 spikes from 2.5K baseline to 25K (10x).
+ *   Typhoon: 00003041 spikes to 11.6K, 00001801 spikes 5.5x.
+ *   Stasis: no draw-count spike (fullscreen quad, needs separate fix).
+ *
+ * Full LR→param map: see bottom of file.
  */
 
 #include <psp2/kernel/modulemgr.h>
 #include <psp2/kernel/clib.h>
+#include <psp2/display.h>
+#include <psp2/gxm.h>
 #include <taihen.h>
 
-/* ============================================================
- * TUNING
- * ============================================================ */
-#define EXPAND_RIGHT   25.0f
-#define EXPAND_DOWN    0.7f
-#define EXPAND_UP      0.0f
-#define OFFSET_X       0.0f
-#define OFFSET_Y       -0.7f
-
-#define SHADOW_DIM     5       /* shadow map: 0=1024, 5=16×16      */
-#define TV_SCALE       3.0f    /* TextViewer canvas scale           */
-
-/* ============================================================
- * GXP SHADER PATCHES — per-group toggles
+/* ================================================================
+ *  LOD TUNING — all distances in game units (~meters)
  *
- * A:  #608+#609  comic panel + caption       (1/720, 1/408)
- * B:  #239       motion blur                 (1/360, 1/204)
- * C:  #604+#605  near comic area             (1/720, 1/408)
- * D1: #613       near comic area             (1/720, 1/408)
- * D2: #614       near comic area             (1/720, 1/408)
- * E1: #616       alt context                 (1/720, 1/408)
- * E2: #617       alt context                 (1/720, 1/408)
- * F:  #24        far shader                  (1/720, 1/408)
- * G:  #238       near motion blur            (1/720, 1/408)
- * H:  #545+#581  2-slot shaders              (1/720, 1/408)
- *
- * NUCLEAR: ignore all above, scan entire data segment instead
- * ============================================================ */
-#define GXP_A       1
-#define GXP_B       1
-#define GXP_C       0
-#define GXP_D1      1
-#define GXP_D2      0
-#define GXP_E1      1
-#define GXP_E2      0
-#define GXP_F       0
-#define GXP_G       0
-#define GXP_H       0
-#define GXP_NUCLEAR 0   /* 1 = ignore above, patch all 78 reciprocals */
+ *  Stock values ~50–1000. Lower = more aggressive LOD = better perf.
+ *  Set to 0 to keep stock for that level.
+ * ================================================================ */
 
-/* ============================================================ */
-#define MAX_INJECT 24
-static SceUID g_inject[MAX_INJECT];
-static int g_ninject = 0;
+/* ---- World geometry (buildings, trees, roads, terrain) ---------- */
+#define ENABLE_WORLD_LOD    1
+#define LOD_LEVEL1    25.0f
+#define LOD_LEVEL2    65.0f
+#define LOD_LEVEL3    85.0f    /* keep stock */
+#define LOD_LEVEL4    200.0f
+#define LOD_LEVEL5    325.0f
+#define LOD_LEVEL6    350.0f
+#define LOD_LEVEL7    400.0f
 
-static SceUID         g_hook_id = -1;
-static tai_hook_ref_t g_hook_ref;
-static SceUID         g_tv_hook_id = -1;
-static tai_hook_ref_t g_tv_hook_ref;
+/* ---- Particles (effects, dust, sparks) -------------------------- */
+#define ENABLE_PARTICLE_LOD 1
+#define PLOD_LEVEL1        0.001f
+#define PLOD_LEVEL2        0.001f
+#define PLOD_LEVEL3        0.001f
+#define PLOD_LEVEL4        0.001f
+#define PLOD_LEVEL5        0.001f
+#define PLOD_LEVEL6        0.001f
+#define PLOD_LEVEL7        0.001f
 
-static inline void inject(SceUID modid, uint32_t off,
-                           const void *data, size_t len)
-{
-    if (g_ninject >= MAX_INJECT) return;
-    SceUID id = taiInjectData(modid, 0, off, data, len);
-    if (id >= 0) g_inject[g_ninject++] = id;
-}
+/* ---- Characters (NPCs, enemies, Kat) ---------------------------- */
+#define ENABLE_CHAR_LOD     1
+#define CLOD_LEVEL1        7.0f
+#define CLOD_LEVEL2        8.0f
+#define CLOD_LEVEL3        9.0f
+#define CLOD_LEVEL4        10.0f
+#define CLOD_LEVEL5        10.0f
+#define CLOD_LEVEL6        10.0f
+#define CLOD_LEVEL7        10.0f
 
 /* ================================================================
- * TEXTBOX EXPANSION — hook 0x11469C
+ *  SHADOW TUNING
+ *
+ *  Stock: FarMax1=100, FarMax2=60, NearMin=1, LightRange=300,
+ *         PolyOffset=1, ZOffset=0.1, OutValue=0.5
+ *  Set to 0 to keep stock for that param.
  * ================================================================ */
-static int hookTransform(uint32_t r0) {
+#define ENABLE_SHADOW       1
+#define SHADOW_FARMAX1     100.0f
+#define SHADOW_FARMAX2     50.0f
+#define SHADOW_NEARMIN      0.0f    /* keep stock */
+#define SHADOW_LIGHTRANGE  300.0f
+#define SHADOW_POLYOFFSET   0.0f    /* keep stock */
+#define SHADOW_ZOFFSET      0.0f    /* keep stock */
+#define SHADOW_OUTVALUE     0.5f   /* keep stock */
+
+/* ================================================================
+ *  SKINNING — bone count per vertex
+ *
+ *  Stock: 4 bones per vertex (high quality blending).
+ *  Set SKINNING_BONES to 2 for ~50% skinning cost reduction.
+ *  Set to 1 for rigid (single-bone, cheapest, visible snapping).
+ *  4 patch sites in the main skinning function at VA 0x8136AF78.
+ * ================================================================ */
+#define ENABLE_SKINNING_OPT 1
+#define SKINNING_BONES      1       /* 1–4, stock=4 */
+
+/* ================================================================
+ *  GLOW — stasis sphere / effect glow reduction
+ *
+ *  GlowColor/Intensity: post-process glow brightness.
+ *  Caller 0x81015E74 intercepted by hookParamLoader.
+ *  Set GLOW_INTENSITY to 0 to keep stock.
+ *
+ *  NOTE: 0xB9C8/0xB9FA (180×102) is the OCCLUSION MAP, not glow RT.
+ *  Do NOT downscale — breaks visibility culling and causes pop-in.
+ * ================================================================ */
+#define ENABLE_GLOW_OPT     1
+#define GLOW_INTENSITY      0.5f    /* 0.0–1.0, stock ~1.0 */
+
+/* ================================================================
+ *  DRAW THROTTLE — reduce overdraw by GXP shader type
+ *
+ *  Reads SceGxmFragmentProgram* from ctx+0x44 on every sceGxmDraw.
+ *  Checks GXP type at SceGxmProgram+0x14. Matching draws get their
+ *  indexCount divided, keeping whole quads (aligned to 6 indices).
+ *
+ *  Set any divisor to 1 to disable that category.
+ * ================================================================ */
+#define ENABLE_DRAW_THROTTLE  1
+
+/* Particle/effect: fire, smoke, sparks, glow (29 shaders) */
+#define PARTICLE_DIVISOR      256
+
+/* Distortion: MBH vortex warp, typhoon swirl (2 shaders)
+ * These read full framebuffer per draw — extremely expensive. */
+#define DISTORTION_DIVISOR    256
+
+/* Effect passes: attack debris/energy renders (12 shaders)
+ * 2.6x spike during MBH, 5.5x during typhoon. */
+#define EFFECT_DIVISOR        1
+
+/* ================================================================ */
+
+#define EXPAND_RIGHT 25.0f
+#define EXPAND_DOWN  0.7f
+#define OFFSET_Y     -0.7f
+#define TV_SCALE     3.0f
+
+#define MAX_INJECT 20
+static SceUID g_inject[MAX_INJECT];
+static int    g_ninject;
+static SceUID g_hook_id=-1, g_tv_hook_id=-1, g_param_hook_id=-1;
+static tai_hook_ref_t g_hook_ref, g_tv_hook_ref, g_param_hook_ref;
+
+#if ENABLE_DRAW_THROTTLE
+static SceUID g_draw_hook_id=-1;
+static tai_hook_ref_t g_draw_hook_ref;
+#define FP_CTX_OFF 0x44
+#endif
+
+static inline void inject(SceUID mod, uint32_t off, const void *d, size_t n) {
+    if (g_ninject < MAX_INJECT) {
+        SceUID id = taiInjectData(mod, 0, off, d, n);
+        if (id >= 0) g_inject[g_ninject++] = id;
+    }
+}
+
+/* ---- CORRECTED caller tables (v52, verified via MOVW/BL decode) ---- */
+
+static const uint32_t lod_callers[7] = {
+    0x81016156, 0x81016168, 0x8101617A, 0x8101618C,
+    0x8101619E, 0x810161B0, 0x810161C2
+};
+static const float lod_values[7] = {
+    LOD_LEVEL1, LOD_LEVEL2, LOD_LEVEL3, LOD_LEVEL4,
+    LOD_LEVEL5, LOD_LEVEL6, LOD_LEVEL7
+};
+
+static const uint32_t plod_callers[7] = {
+    0x810161D4, 0x810161E6, 0x810161F8, 0x8101620A,
+    0x8101621C, 0x8101622E, 0x81016240
+};
+static const float plod_values[7] = {
+    PLOD_LEVEL1, PLOD_LEVEL2, PLOD_LEVEL3, PLOD_LEVEL4,
+    PLOD_LEVEL5, PLOD_LEVEL6, PLOD_LEVEL7
+};
+
+static const uint32_t clod_callers[7] = {
+    0x81016252, 0x81016264, 0x81016276, 0x81016288,
+    0x8101629A, 0x810162AC, 0x810162BE
+};
+static const float clod_values[7] = {
+    CLOD_LEVEL1, CLOD_LEVEL2, CLOD_LEVEL3, CLOD_LEVEL4,
+    CLOD_LEVEL5, CLOD_LEVEL6, CLOD_LEVEL7
+};
+
+static const uint32_t shd_callers[7] = {
+    0x81015D9C,  /* Shadow/AutoAdjust   */
+    0x81015DAE,  /* Shadow/FarMax1      */
+    0x81015DC0,  /* Shadow/FarMax2      */
+    0x81015DD2,  /* Shadow/NearMin      */
+    0x81015DE4,  /* Shadow/LightRange   */
+    0x81015DF6,  /* Shadow/PolygonOffset */
+    0x81015E08   /* Shadow/ZOffset      */
+};
+static const float shd_values[7] = {
+    0.0f, SHADOW_FARMAX1, SHADOW_FARMAX2, SHADOW_NEARMIN,
+    SHADOW_LIGHTRANGE, SHADOW_POLYOFFSET, SHADOW_ZOFFSET
+};
+
+static int hookParamLoader(uint32_t r0, uint32_t r1, uint32_t r2)
+{
     uint32_t lr;
     __asm__ volatile("mov %0, lr" : "=r"(lr));
 
-    if (!r0)
-        return TAI_CONTINUE(int, g_hook_ref, r0);
+    int ret = TAI_CONTINUE(int, g_param_hook_ref, r0, r1, r2);
 
-    switch (lr) {
-    case 0x813B3F61:
-    case 0x813B5181: {
-        volatile float *f = (volatile float *)r0;
-        float s0 = f[0], s1 = f[1];
-        f[0] = s0 + OFFSET_X;
-        f[1] = s1 + EXPAND_UP + OFFSET_Y;
-        int ret = TAI_CONTINUE(int, g_hook_ref, r0);
-        f[0] = s0; f[1] = s1;
+    uint32_t caller = lr & ~1u;
+
+    #if ENABLE_WORLD_LOD
+    for (int i = 0; i < 7; i++) {
+        if (caller == lod_callers[i] && lod_values[i] > 0.0f && r2) {
+            *(volatile float *)r2 = lod_values[i];
+            return ret;
+        }
+    }
+    #endif
+
+    #if ENABLE_PARTICLE_LOD
+    for (int i = 0; i < 7; i++) {
+        if (caller == plod_callers[i] && plod_values[i] > 0.0f && r2) {
+            *(volatile float *)r2 = plod_values[i];
+            return ret;
+        }
+    }
+    #endif
+
+    #if ENABLE_CHAR_LOD
+    for (int i = 0; i < 7; i++) {
+        if (caller == clod_callers[i] && clod_values[i] > 0.0f && r2) {
+            *(volatile float *)r2 = clod_values[i];
+            return ret;
+        }
+    }
+    #endif
+
+    #if ENABLE_SHADOW
+    for (int i = 0; i < 7; i++) {
+        if (caller == shd_callers[i] && shd_values[i] > 0.0f && r2) {
+            *(volatile float *)r2 = shd_values[i];
+            return ret;
+        }
+    }
+    #endif
+
+    #if ENABLE_GLOW_OPT
+    if (caller == 0x81015E74 && GLOW_INTENSITY > 0.0f && r2) {
+        *(volatile float *)r2 = GLOW_INTENSITY;
         return ret;
     }
-    case 0x813B3F85:
-    case 0x813B51AD: {
-        volatile float *f = (volatile float *)r0;
-        float s0 = f[0], s1 = f[1];
-        f[0] = s0 + EXPAND_RIGHT + OFFSET_X;
-        f[1] = s1 - EXPAND_DOWN + OFFSET_Y;
-        int ret = TAI_CONTINUE(int, g_hook_ref, r0);
-        f[0] = s0; f[1] = s1;
-        return ret;
-    }
-    default:
-        return TAI_CONTINUE(int, g_hook_ref, r0);
-    }
-}
+    #endif
 
-/* ================================================================
- * CREDITS TEXT FIX — hook TextViewer at 0x382130
- *
- * Context struct rect: +0x28=X, +0x2C=Y, +0x30=W, +0x34=H
- * Scale W/H by TV_SCALE, shift X left to anchor left edge.
- * Y unchanged (credits scroll bottom-to-top).
- * ================================================================ */
-static int hookTextViewer(uint32_t r0) {
-    if (!r0)
-        return TAI_CONTINUE(int, g_tv_hook_ref, r0);
-
-    volatile float *f = (volatile float *)r0;
-    float sx = f[0x28/4], sy = f[0x2C/4];
-    float sw = f[0x30/4], sh = f[0x34/4];
-    float dw = sw * (TV_SCALE - 1.0f);
-    f[0x30/4] = sw + dw;
-    f[0x34/4] = sh * TV_SCALE;
-    f[0x28/4] = sx - dw * 0.5f;
-
-    int ret = TAI_CONTINUE(int, g_tv_hook_ref, r0);
-
-    f[0x28/4] = sx; f[0x2C/4] = sy;
-    f[0x30/4] = sw; f[0x34/4] = sh;
     return ret;
 }
 
-/* ================================================================
- * GXP SHADER PATCHES
- * ================================================================ */
-static void patch_gxp(uint32_t *s1, int memsz)
+static int hookTransform(uint32_t r0) {
+    uint32_t lr; __asm__ volatile("mov %0, lr":"=r"(lr));
+    if (!r0) return TAI_CONTINUE(int,g_hook_ref,r0);
+    switch (lr) {
+        case 0x813B3F61: case 0x813B5181: {
+            volatile float *f=(volatile float*)r0;
+            float s0=f[0],s1=f[1]; f[1]=s1+OFFSET_Y;
+            int ret=TAI_CONTINUE(int,g_hook_ref,r0);
+            f[0]=s0;f[1]=s1;return ret;}
+        case 0x813B3F85: case 0x813B51AD: {
+            volatile float *f=(volatile float*)r0;
+            float s0=f[0],s1=f[1]; f[0]=s0+EXPAND_RIGHT;f[1]=s1-EXPAND_DOWN+OFFSET_Y;
+            int ret=TAI_CONTINUE(int,g_hook_ref,r0);
+            f[0]=s0;f[1]=s1;return ret;}
+        default: return TAI_CONTINUE(int,g_hook_ref,r0);
+    }
+}
+static int hookTextViewer(uint32_t r0) {
+    if (!r0) return TAI_CONTINUE(int,g_tv_hook_ref,r0);
+    volatile float *f=(volatile float*)r0;
+    float sx=f[0x28/4],sy=f[0x2C/4],sw=f[0x30/4],sh=f[0x34/4];
+    float dw=sw*(TV_SCALE-1.0f);
+    f[0x30/4]=sw+dw;f[0x34/4]=sh*TV_SCALE;f[0x28/4]=sx-dw*0.5f;
+    int ret=TAI_CONTINUE(int,g_tv_hook_ref,r0);
+    f[0x28/4]=sx;f[0x2C/4]=sy;f[0x30/4]=sw;f[0x34/4]=sh;
+    return ret;
+}
+
+#if ENABLE_DRAW_THROTTLE
+static int hookDraw(SceGxmContext *ctx,
+                    SceGxmPrimitiveType primType,
+                    SceGxmIndexFormat   idxFmt,
+                    const void         *idxData,
+                    unsigned int        idxCount)
 {
-    #if GXP_NUCLEAR
-    /* Scan entire data segment — replaces all 78 reciprocals */
-    int n = memsz / 4, i;
-    for (i = 0; i < n; i++) {
-        switch (s1[i]) {
-            case 0x3AB60B61u: s1[i] = 0x3A888889u; break; /* 1/720 → 1/960 */
-            case 0x3B20A0A1u: s1[i] = 0x3AF0F0F1u; break; /* 1/408 → 1/544 */
-            case 0x3B360B61u: s1[i] = 0x3B088889u; break; /* 1/360 → 1/480 */
-            case 0x3BA0A0A1u: s1[i] = 0x3B70F0F1u; break; /* 1/204 → 1/272 */
+    if (idxCount > 6) {
+        const SceGxmFragmentProgram *fp =
+            *(const SceGxmFragmentProgram **)((uintptr_t)ctx + FP_CTX_OFF);
+        if (fp) {
+            const SceGxmProgram *prog = sceGxmFragmentProgramGetProgram(fp);
+            if (prog) {
+                uint32_t type = *(const uint32_t *)((uintptr_t)prog + 0x14);
+                int div = 0;
+                switch (type) {
+                #if PARTICLE_DIVISOR > 1
+                case 0x000030C1u:           /* particle/effect        */
+                case 0x000032C1u:           /* particle+alpha         */
+                    div = PARTICLE_DIVISOR;
+                    break;
+                #endif
+                #if DISTORTION_DIVISOR > 1
+                case 0x00003041u:           /* MBH/typhoon distortion */
+                    div = DISTORTION_DIVISOR;
+                    break;
+                #endif
+                #if EFFECT_DIVISOR > 1
+                case 0x00001801u:           /* attack effect passes   */
+                    div = EFFECT_DIVISOR;
+                    break;
+                #endif
+                }
+                if (div > 1) {
+                    idxCount /= div;
+                    idxCount -= idxCount % 6;
+                    if (idxCount < 6) idxCount = 6;
+                }
+            }
         }
     }
-    #else
+    return TAI_CONTINUE(int, g_draw_hook_ref, ctx, primType, idxFmt,
+                        idxData, idxCount);
+}
+#endif
+static void patch_gxp(uint32_t *s1, int memsz) {
     (void)memsz;
-    #if GXP_A /* #608 comic panel + #609 caption */
     s1[(0x72954+0x208)/4]=0x3A888889u;s1[(0x72954+0x21C)/4]=0x3A888889u;
     s1[(0x72954+0x224)/4]=0x3A888889u;s1[(0x72954+0x228)/4]=0x3A888889u;
     s1[(0x72954+0x210)/4]=0x3AF0F0F1u;s1[(0x72954+0x220)/4]=0x3AF0F0F1u;
     s1[(0x72C28+0x238)/4]=0x3A888889u;s1[(0x72C28+0x24C)/4]=0x3A888889u;
     s1[(0x72C28+0x254)/4]=0x3A888889u;s1[(0x72C28+0x258)/4]=0x3A888889u;
     s1[(0x72C28+0x240)/4]=0x3AF0F0F1u;s1[(0x72C28+0x250)/4]=0x3AF0F0F1u;
-    #endif
-    #if GXP_B /* #239 motion blur (1/360, 1/204) */
     s1[(0x3BBC0+0x158)/4]=0x3B088889u;s1[(0x3BBC0+0x19C)/4]=0x3B088889u;
     s1[(0x3BBC0+0x1A4)/4]=0x3B088889u;s1[(0x3BBC0+0x1A8)/4]=0x3B088889u;
     s1[(0x3BBC0+0x160)/4]=0x3B70F0F1u;s1[(0x3BBC0+0x1A0)/4]=0x3B70F0F1u;
-    #endif
-    #if GXP_C /* #604 + #605 */
-    s1[(0x7211c+0x150)/4]=0x3A888889u;s1[(0x7211c+0x164)/4]=0x3A888889u;
-    s1[(0x7211c+0x16c)/4]=0x3A888889u;s1[(0x7211c+0x170)/4]=0x3A888889u;
-    s1[(0x7211c+0x158)/4]=0x3AF0F0F1u;s1[(0x7211c+0x168)/4]=0x3AF0F0F1u;
-    s1[(0x722e0+0x190)/4]=0x3A888889u;s1[(0x722e0+0x1a4)/4]=0x3A888889u;
-    s1[(0x722e0+0x1ac)/4]=0x3A888889u;s1[(0x722e0+0x1b0)/4]=0x3A888889u;
-    s1[(0x722e0+0x198)/4]=0x3AF0F0F1u;s1[(0x722e0+0x1a8)/4]=0x3AF0F0F1u;
-    #endif
-    #if GXP_D1 /* #613 */
-    s1[(0x737dc+0x2e8)/4]=0x3A888889u;s1[(0x737dc+0x314)/4]=0x3A888889u;
-    s1[(0x737dc+0x31c)/4]=0x3A888889u;s1[(0x737dc+0x320)/4]=0x3A888889u;
-    s1[(0x737dc+0x2f0)/4]=0x3AF0F0F1u;s1[(0x737dc+0x318)/4]=0x3AF0F0F1u;
-    #endif
-    #if GXP_D2 /* #614 */
-    s1[(0x73c00+0x350)/4]=0x3A888889u;s1[(0x73c00+0x37c)/4]=0x3A888889u;
-    s1[(0x73c00+0x384)/4]=0x3A888889u;s1[(0x73c00+0x388)/4]=0x3A888889u;
-    s1[(0x73c00+0x358)/4]=0x3AF0F0F1u;s1[(0x73c00+0x380)/4]=0x3AF0F0F1u;
-    #endif
-    #if GXP_E1 /* #616 */
+    s1[(0x737DC+0x2E8)/4]=0x3A888889u;s1[(0x737DC+0x314)/4]=0x3A888889u;
+    s1[(0x737DC+0x31C)/4]=0x3A888889u;s1[(0x737DC+0x320)/4]=0x3A888889u;
+    s1[(0x737DC+0x2F0)/4]=0x3AF0F0F1u;s1[(0x737DC+0x318)/4]=0x3AF0F0F1u;
     s1[(0x7440C+0x2F0)/4]=0x3A888889u;s1[(0x7440C+0x30C)/4]=0x3A888889u;
     s1[(0x7440C+0x314)/4]=0x3A888889u;s1[(0x7440C+0x318)/4]=0x3A888889u;
     s1[(0x7440C+0x2F8)/4]=0x3AF0F0F1u;s1[(0x7440C+0x310)/4]=0x3AF0F0F1u;
-    #endif
-    #if GXP_E2 /* #617 */
-    s1[(0x74800+0x330)/4]=0x3A888889u;s1[(0x74800+0x34C)/4]=0x3A888889u;
-    s1[(0x74800+0x354)/4]=0x3A888889u;s1[(0x74800+0x358)/4]=0x3A888889u;
-    s1[(0x74800+0x338)/4]=0x3AF0F0F1u;s1[(0x74800+0x350)/4]=0x3AF0F0F1u;
-    #endif
-    #if GXP_F /* #24 */
-    s1[(0x05838+0x314)/4]=0x3A888889u;s1[(0x05838+0x368)/4]=0x3A888889u;
-    s1[(0x05838+0x370)/4]=0x3A888889u;s1[(0x05838+0x374)/4]=0x3A888889u;
-    s1[(0x05838+0x31c)/4]=0x3AF0F0F1u;s1[(0x05838+0x36c)/4]=0x3AF0F0F1u;
-    #endif
-    #if GXP_G /* #238 */
-    s1[(0x3b998+0x144)/4]=0x3A888889u;s1[(0x3b998+0x188)/4]=0x3A888889u;
-    s1[(0x3b998+0x190)/4]=0x3A888889u;s1[(0x3b998+0x194)/4]=0x3A888889u;
-    s1[(0x3b998+0x14c)/4]=0x3AF0F0F1u;s1[(0x3b998+0x18c)/4]=0x3AF0F0F1u;
-    #endif
-    #if GXP_H /* #545 + #581 */
-    s1[(0x699cc+0x124)/4]=0x3A888889u;s1[(0x699cc+0x130)/4]=0x3A888889u;
-    s1[(0x699cc+0x12c)/4]=0x3AF0F0F1u;s1[(0x699cc+0x140)/4]=0x3AF0F0F1u;
-    s1[(0x6fc54+0x164)/4]=0x3A888889u;s1[(0x6fc54+0x198)/4]=0x3A888889u;
-    s1[(0x6fc54+0x15c)/4]=0x3AF0F0F1u;s1[(0x6fc54+0x1a8)/4]=0x3AF0F0F1u;
-    #endif
-    #endif /* !GXP_NUCLEAR */
 }
 
-/* ================================================================ */
 void _start() __attribute__((weak, alias("module_start")));
+int module_start(SceSize args, void *argp) {
+    (void)args;(void)argp; g_ninject=0;
+    tai_module_info_t info; info.size=sizeof(info);
+    if (taiGetModuleInfo(TAI_MAIN_MODULE,&info)<0) return SCE_KERNEL_START_FAILED;
+    SceUID mod=info.modid;
+    SceKernelModuleInfo mi; sceClibMemset(&mi,0,sizeof(mi)); mi.size=sizeof(mi);
+    if (sceKernelGetModuleInfo(mod,&mi)<0) return SCE_KERNEL_START_FAILED;
 
-int module_start(SceSize args, void *argp)
-{
-    (void)args; (void)argp;
-    g_ninject = 0;
+    /* ---- FB resolution: 720×408 → 960×544 ----------------------- */
+    /* fb0 @ 0x00284: width=960, store, height=544  (10 bytes)       */
+    static const uint8_t fb0[]={
+        0x5F,0xF4,0x70,0x70,              /* movs.w r0, #960           */
+        0x1A,0x90,                         /* str    r0, [sp, #0x68]    */
+        0x5F,0xF4,0x08,0x70               /* movs.w r0, #544           */
+    };
+    inject(mod, 0x00284, fb0, sizeof(fb0));
 
-    tai_module_info_t info;
-    info.size = sizeof(info);
-    if (taiGetModuleInfo(TAI_MAIN_MODULE, &info) < 0)
-        return SCE_KERNEL_START_FAILED;
+    /* fb1+w_r3 @ 0x45E9C: merged late FB init (44 bytes, was 2 injects)
+     * bytes 0–13:  height=544, store, stride=0x6994, width=960
+     * bytes 14–39: stock code (untouched, bridges the gap)
+     * bytes 40–43: width=960 in r3                                  */
+    static const uint8_t fb1m[]={
+        0x5F,0xF4,0x08,0x70,              /* movs.w r0, #544           */
+        0x00,0x90,                         /* str    r0, [sp]           */
+        0x46,0xF2,0x94,0x55,              /* movw   r5, #0x6994(stride)*/
+        0x5F,0xF4,0x70,0x70,              /* movs.w r0, #960           */
+        /* --- stock bytes 0x45EAA–0x45EC3 (26 bytes, unchanged) --- */
+        0x01,0x90,0x43,0xF6,0xC4,0x36,
+        0xC8,0xF2,0x52,0x15,0x28,0x68,
+        0xC8,0xF2,0x68,0x16,0x03,0x94,
+        0x03,0x22,0x31,0x1C,
+        0xC0,0xF2,0x10,0x02,
+        /* --- w_r3 @ 0x45EC4 ------------------------------------ */
+        0x5F,0xF4,0x70,0x73               /* movs.w r3, #960           */
+    };
+    inject(mod, 0x45E9C, fb1m, sizeof(fb1m));
 
-    SceUID mod = info.modid;
+    /* fb2 @ 0x06974: IB init (10 bytes)                             */
+    static const uint8_t fb2[]={
+        0x5F,0xF4,0x70,0x71,              /* movs.w r1, #960           */
+        0x01,0x60,                         /* str    r1, [r0]           */
+        0x5F,0xF4,0x08,0x71               /* movs.w r1, #544           */
+    };
+    inject(mod, 0x06974, fb2, sizeof(fb2));
 
-    /* Single module info lookup — shared with patch_gxp */
-    SceKernelModuleInfo mi;
-    sceClibMemset(&mi, 0, sizeof(mi));
-    mi.size = sizeof(mi);
-    if (sceKernelGetModuleInfo(mod, &mi) < 0)
-        return SCE_KERNEL_START_FAILED;
+    /* ---- IRB: internal render buffer 960×544 -------------------- */
+    static const uint8_t irb[]={
+        0x5F,0xF4,0x08,0x79,              /* movs.w r9,  #544          */
+        0xCD,0xF8,0x00,0x90,              /* str.w  r9,  [sp]          */
+        0x5F,0xF4,0x70,0x7A,              /* movs.w r10, #960          */
+        0xCD,0xF8,0x04,0xA0,              /* str.w  r10, [sp, #4]      */
+        0x5F,0xF0,0x00,0x0B,              /* movs.w r11, #0   (depth)  */
+        0xCD,0xF8,0x0C,0xB0,              /* str.w  r11, [sp, #0xC]    */
+        0x21,0x1C,                         /* movs   r1,  r4            */
+        0x5F,0xF0,0x80,0x72,              /* movs.w r2,  #0x1000000    */
+        0x5F,0xF4,0x70,0x73               /* movs.w r3,  #960          */
+    };
+    inject(mod, 0x0C46C, irb, sizeof(irb));
 
-    /* Thumb-2 movs.w encodings: width=960, height=544 per register */
-    static const uint8_t w_r0[]  = {0x5F,0xF4,0x70,0x70};
-    static const uint8_t h_r0[]  = {0x5F,0xF4,0x08,0x70};
-    static const uint8_t w_r1[]  = {0x5F,0xF4,0x70,0x71};
-    static const uint8_t h_r1[]  = {0x5F,0xF4,0x08,0x71};
-    static const uint8_t w_r3[]  = {0x5F,0xF4,0x70,0x73};
-    static const uint8_t h_r9[]  = {0x5F,0xF4,0x08,0x79};
-    static const uint8_t w_r10[] = {0x5F,0xF4,0x70,0x7A};
-    static const uint8_t nop2[]  = {0x00,0xBF};
-    static const uint8_t sm_lr[] = {0x5F,0xF4,0x00,0x7E};
-    static const uint8_t sm_r3[] = {0x5F,0xF4,0x00,0x73};
-    #if SHADOW_DIM == 5
-    static const uint8_t sd_r0[] = {0x5F,0xF0,0x10,0x00};
-    #endif
-    static const uint8_t scroll[16] = {
-        0xF5,0xEE,0x00,0x0A, 0x38,0xEE,0x80,0x0A,
-        0x20,0xEE,0x20,0x0A, 0x86,0xED,0x0D,0x0A };
+    /* w_r3 @ 0x0C4F6 (4 bytes)                                     */
+    static const uint8_t w_r3[]={0x5F,0xF4,0x70,0x73};
+    inject(mod, 0x0C4F6, w_r3, 4);
 
-    /* Framebuffer 720×408 → 960×544 */
-    inject(mod, 0x284,   w_r0,  4);
-    inject(mod, 0x28A,   h_r0,  4);
-    inject(mod, 0x45E9C, h_r0,  4);
-    inject(mod, 0x45EA6, w_r0,  4);
-    inject(mod, 0x45EC4, w_r3,  4);
-    inject(mod, 0x6974,  w_r1,  4);
-    inject(mod, 0x697A,  h_r1,  4);
+    /* ---- MSAA: force disable ------------------------------------ */
+    { static const uint8_t sd[]={0x5F,0xF0,0x10,0x00};
+      inject(mod, 0x05534, sd, 4); }
 
-    /* Internal render buffer */
-    inject(mod, 0xC46C, h_r9,  4);
-    inject(mod, 0xC474, w_r10, 4);
-    inject(mod, 0xC48A, w_r3,  4);
-    inject(mod, 0xC4F6, w_r3,  4);
+    /* ---- Scroll: VFP scroll speed for 960-space ----------------- */
+    static const uint8_t scroll[]={
+        0xF5,0xEE,0x00,0x0A,              /* vsub.f32 s0, s30, s0      */
+        0x38,0xEE,0x80,0x0A,              /* vsub.f32 s0, s16, s0      */
+        0x20,0xEE,0x20,0x0A,              /* vmul.f32 s0, s0,  s1      */
+        0x86,0xED,0x0D,0x0A               /* vstr     s0, [r6, #0x34]  */
+    };
+    inject(mod, 0x3B52EC, scroll, sizeof(scroll));
 
-    /* Shadow map 1024 → 512 */
-    inject(mod, 0xC62C, sm_lr, 4);
-    inject(mod, 0xC644, sm_r3, 4);
-
-    /* Shadow dim 1024 → 16 */
-    #if SHADOW_DIM == 5
-    inject(mod, 0x5534, sd_r0, 4);
-    #endif
-
-    /* Scroll patch + text cull bypass */
-    inject(mod, 0x3B52EC, scroll, 16);
-    inject(mod, 0x3B3CDC, nop2, 2);
-    inject(mod, 0x3B3CF0, nop2, 2);
+    /* ---- Text cull: disable 75% width clipping ------------------ */
+    static const uint8_t cull01[]={
+        0x00,0xBF,                         /* nop                       */
+        0x98,0xED,0x08,0x0A,              /* vldr    s0, [r8, #0x20]   */
+        0xD8,0xED,0x0D,0x0A,              /* vldr    s1, [r8, #0x34]   */
+        0xB4,0xEE,0x60,0x0A,              /* vcmp.f32 s0, s1           */
+        0xF1,0xEE,0x10,0xFA,              /* vmrs    APSR_nzcv, FPSCR  */
+        0x00,0xDC,                         /* bgt     +0                */
+        0x00,0xBF                          /* nop                       */
+    };
+    static const uint8_t nop2[]={0x00,0xBF};
+    inject(mod, 0x3B3CDC, cull01, sizeof(cull01));
     inject(mod, 0x3B549C, nop2, 2);
     inject(mod, 0x3B54E8, nop2, 2);
     inject(mod, 0x3B5524, nop2, 2);
 
-    /* GXP shader sweep — reuse module info from above */
-    patch_gxp((uint32_t *)mi.segments[1].vaddr, mi.segments[1].memsz);
+    /* ---- GXP: shader resolution constants ----------------------- */
+    patch_gxp((uint32_t*)mi.segments[1].vaddr, mi.segments[1].memsz);
 
-    /* Hooks */
-    g_hook_id = taiHookFunctionOffset(&g_hook_ref, mod, 0,
-                                      0x11469C, 1, (void *)hookTransform);
-    g_tv_hook_id = taiHookFunctionOffset(&g_tv_hook_ref, mod, 0,
-                                         0x382130, 1, (void *)hookTextViewer);
+    /* ---- Skinning: reduce bone count per vertex ----------------- */
+    #if ENABLE_SKINNING_OPT && SKINNING_BONES < 4
+    {   static const uint8_t skin[] = {SKINNING_BONES-1, 0x22};
+        inject(mod, 0x36B236, skin, 2);   /* path A position           */
+        inject(mod, 0x36B274, skin, 2);   /* path A normal             */
+        inject(mod, 0x36B5F0, skin, 2);   /* path B position           */
+        inject(mod, 0x36B636, skin, 2);   /* path B normal             */
+    }
+    #endif
+
+    /* ---- Hooks -------------------------------------------------- */
+    g_hook_id=taiHookFunctionOffset(&g_hook_ref,mod,0,0x11469C,1,(void*)hookTransform);
+    g_tv_hook_id=taiHookFunctionOffset(&g_tv_hook_ref,mod,0,0x382130,1,(void*)hookTextViewer);
+    g_param_hook_id=taiHookFunctionOffset(&g_param_hook_ref,mod,0,0x19230,1,(void*)hookParamLoader);
+
+    #if ENABLE_DRAW_THROTTLE
+    g_draw_hook_id=taiHookFunctionImport(&g_draw_hook_ref,
+        TAI_MAIN_MODULE, TAI_ANY_LIBRARY,
+        0xBC059AFC, (const void *)hookDraw);
+    #endif
 
     return SCE_KERNEL_START_SUCCESS;
 }
-
-int module_stop(SceSize args, void *argp)
-{
-    (void)args; (void)argp;
-    if (g_hook_id >= 0)    taiHookRelease(g_hook_id, g_hook_ref);
-    if (g_tv_hook_id >= 0) taiHookRelease(g_tv_hook_id, g_tv_hook_ref);
-    int i;
-    for (i = 0; i < g_ninject; i++)
-        if (g_inject[i] >= 0) taiInjectRelease(g_inject[i]);
+int module_stop(SceSize args, void *argp) {
+    (void)args;(void)argp;
+    if (g_hook_id>=0) taiHookRelease(g_hook_id,g_hook_ref);
+    if (g_tv_hook_id>=0) taiHookRelease(g_tv_hook_id,g_tv_hook_ref);
+    if (g_param_hook_id>=0) taiHookRelease(g_param_hook_id,g_param_hook_ref);
+    #if ENABLE_DRAW_THROTTLE
+    if (g_draw_hook_id>=0) taiHookRelease(g_draw_hook_id,g_draw_hook_ref);
+    #endif
+    for (int i=0;i<g_ninject;i++) if (g_inject[i]>=0) taiInjectRelease(g_inject[i]);
     return SCE_KERNEL_STOP_SUCCESS;
 }
+
+/* ================================================================
+ * COMPLETE LR→PARAM MAP (verified via MOVW/BL decode)
+ *
+ * --- Shadow ---
+ * 0x81015D9C → Shadow/AutoAdjust     Stock: ?
+ * 0x81015DAE → Shadow/FarMax1        Stock: 100.0
+ * 0x81015DC0 → Shadow/FarMax2        Stock: 60.0
+ * 0x81015DD2 → Shadow/NearMin        Stock: 1.0
+ * 0x81015DE4 → Shadow/LightRange     Stock: 300.0
+ * 0x81015DF6 → Shadow/PolygonOffset  Stock: 1.0
+ * 0x81015E08 → Shadow/ZOffset        Stock: 0.1
+ * 0x81015E1A → Shadow/OutValue       Stock: 0.5
+ *
+ * --- GlowColor ---
+ * 0x81015E74 → GlowColor/Intensity   Stock: scene-defined (~1.0)
+ *
+ * --- World LodDistance ---
+ * 0x81016156–0x810161C2 → LodDistance/Level1–7
+ *
+ * --- ParticleLodDistance ---
+ * 0x810161D4–0x81016240 → ParticleLodDistance/Level1–7
+ *
+ * --- CharacterLodDistance ---
+ * 0x81016252–0x810162BE → CharacterLodDistance/Level1–7
+ *
+ * --- ClearColor ---
+ * 0x810162D0–0x810162F4 → ClearColor/R,G,B
+ * ================================================================ */

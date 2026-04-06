@@ -12,5 +12,5 @@ set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wl,-q -Wall -O2 -nostartfiles")
 add_executable(${PROJECT_NAME} main_diag.c)
 target_link_libraries(${PROJECT_NAME}
   taihen_stub SceLibKernel_stub SceKernelModulemgr_stub
-  SceSysmem_stub SceDisplay_stub SceGxm_stub)
+  SceSysmem_stub SceDisplay_stub SceGxm_stub SceCtrl_stub)
 vita_create_self(${PROJECT_NAME}.suprx ${PROJECT_NAME} CONFIG exports.yml UNSAFE)
